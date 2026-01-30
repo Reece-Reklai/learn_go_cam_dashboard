@@ -108,7 +108,6 @@ make help       # Show all targets
 │       └── monitor.go      # CPU/temperature monitoring
 ├── Makefile                # Build system
 ├── install.sh              # Deployment installer
-└── LEARN.md                # Technical deep-dive
 ```
 
 ## Troubleshooting
