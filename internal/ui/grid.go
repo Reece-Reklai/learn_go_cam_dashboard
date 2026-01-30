@@ -7,62 +7,97 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-// GridLayout manages the camera grid layout (similar to Python version)
+// GridLayout manages the camera grid layout
+// Layout: 2x2 grid with Settings in top-left, 3 cameras in remaining slots
 type GridLayout struct {
-	container *fyne.Container
-	widgets   []*CameraWidget
+	container      *fyne.Container
+	widgets        []*CameraWidget
+	settingsWidget *fyne.Container
+	onSettings     func()
 }
 
 // NewGridLayout creates a new grid layout for cameras
 func NewGridLayout() *GridLayout {
-	return &GridLayout{
-		container: container.NewVBox(), // Will be updated with actual grid
+	gl := &GridLayout{
+		container: container.NewVBox(),
 		widgets:   make([]*CameraWidget, 0),
 	}
+
+	// Create settings widget
+	gl.settingsWidget = gl.createSettingsWidget()
+
+	return gl
+}
+
+// createSettingsWidget creates the settings tile for the grid
+func (gl *GridLayout) createSettingsWidget() *fyne.Container {
+	settingsBtn := widget.NewButton("Settings", func() {
+		if gl.onSettings != nil {
+			gl.onSettings()
+		}
+	})
+
+	// Create a container with the button centered
+	return container.NewCenter(settingsBtn)
+}
+
+// SetSettingsHandler sets the callback for settings button
+func (gl *GridLayout) SetSettingsHandler(handler func()) {
+	gl.onSettings = handler
 }
 
 // UpdateCameras updates the grid with new camera list
+// Creates a 2x2 grid: [Settings, Cam1], [Cam2, Cam3]
 func (gl *GridLayout) UpdateCameras(cameras []camera.Camera) {
 	// Clear existing widgets
-	for _, widget := range gl.widgets {
-		widget.Hide()
-	}
 	gl.widgets = gl.widgets[:0]
 
-	// Create new camera widgets
-	var cameraContainers []fyne.CanvasObject
-	for _, cam := range cameras {
-		cameraWidget := NewCameraWidget(cam)
+	// Create camera widgets (up to 3 cameras)
+	maxCameras := 3
+	if len(cameras) < maxCameras {
+		maxCameras = len(cameras)
+	}
+
+	for i := 0; i < maxCameras; i++ {
+		cameraWidget := NewCameraWidget(cameras[i])
 		gl.widgets = append(gl.widgets, cameraWidget)
-		cameraContainers = append(cameraContainers, cameraWidget)
 	}
 
-	// Determine grid layout based on camera count
-	var grid *fyne.Container
-	switch len(cameras) {
-	case 1:
-		grid = container.NewVBox(cameraContainers...)
-	case 2:
-		grid = container.NewHBox(cameraContainers...)
-	case 3:
-		// Two on top, one on bottom (like Python version)
-		grid = container.NewVBox(
-			container.NewHBox(cameraContainers[0], cameraContainers[1]),
-			container.NewHBox(cameraContainers[2]),
-		)
-	default:
-		// Fallback to grid layout for 4+ cameras
-		grid = container.NewGridWithColumns(2, cameraContainers...)
+	// Build 2x2 grid layout
+	// Top row: Settings | Camera 1 (or placeholder)
+	// Bottom row: Camera 2 (or placeholder) | Camera 3 (or placeholder)
+
+	var topLeft, topRight, bottomLeft, bottomRight fyne.CanvasObject
+
+	// Top-left is always settings
+	topLeft = gl.settingsWidget
+
+	// Top-right: Camera 1
+	if len(gl.widgets) >= 1 {
+		topRight = gl.widgets[0].Container
+	} else {
+		topRight = widget.NewLabel("No Camera")
 	}
 
-	// Add settings tile (top-left corner like Python version)
-	settingsTile := widget.NewButton("Settings", func() {
-		// TODO: Implement settings
-	})
-	settingsTile.Resize(fyne.NewSize(100, 100))
+	// Bottom-left: Camera 2
+	if len(gl.widgets) >= 2 {
+		bottomLeft = gl.widgets[1].Container
+	} else {
+		bottomLeft = widget.NewLabel("No Camera")
+	}
 
-	// Create final container with settings overlay
-	gl.container = container.NewStack(grid, settingsTile)
+	// Bottom-right: Camera 3
+	if len(gl.widgets) >= 3 {
+		bottomRight = gl.widgets[2].Container
+	} else {
+		bottomRight = widget.NewLabel("No Camera")
+	}
+
+	// Create 2x2 grid
+	gl.container = container.NewGridWithColumns(2,
+		topLeft, topRight,
+		bottomLeft, bottomRight,
+	)
 }
 
 // GetContainer returns the Fyne container

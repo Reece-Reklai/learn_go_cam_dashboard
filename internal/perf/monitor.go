@@ -13,6 +13,7 @@ type Monitor struct {
 	lastCheck   time.Time
 	loadAvg     float64
 	temperature float64
+	memoryUsage float64 // Percentage of memory used
 }
 
 // NewMonitor creates a new performance monitor
@@ -33,6 +34,9 @@ func (m *Monitor) UpdateStats() error {
 	if err := m.updateTemperature(); err != nil {
 		return err
 	}
+
+	// Update memory usage
+	m.updateMemoryUsage() // Non-critical, ignore errors
 
 	m.lastCheck = time.Now()
 	return nil
@@ -99,6 +103,42 @@ func (m *Monitor) GetLoadAverage() float64 {
 // GetTemperature returns current temperature in Celsius
 func (m *Monitor) GetTemperature() float64 {
 	return m.temperature
+}
+
+// GetMemoryUsage returns memory usage percentage (0-100)
+func (m *Monitor) GetMemoryUsage() float64 {
+	return m.memoryUsage
+}
+
+// updateMemoryUsage reads memory stats from /proc/meminfo
+func (m *Monitor) updateMemoryUsage() error {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return err
+	}
+
+	var memTotal, memAvailable int64
+	lines := strings.Split(string(data), "\n")
+
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+
+		switch fields[0] {
+		case "MemTotal:":
+			memTotal, _ = strconv.ParseInt(fields[1], 10, 64)
+		case "MemAvailable:":
+			memAvailable, _ = strconv.ParseInt(fields[1], 10, 64)
+		}
+	}
+
+	if memTotal > 0 {
+		m.memoryUsage = 100.0 * float64(memTotal-memAvailable) / float64(memTotal)
+	}
+
+	return nil
 }
 
 // IsUnderStress returns true if system is under stress

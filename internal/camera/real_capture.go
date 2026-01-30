@@ -27,17 +27,19 @@ func (cw *CaptureWorker) captureRealCamera() {
 
 	fmt.Printf("Camera %s detected, implementing capture system\n", cw.camera.DeviceID)
 
-	ticker := time.NewTicker(33 * time.Millisecond) // ~30 FPS
+	// Use FPS from config.go
+	frameInterval := time.Second / time.Duration(CameraFPS)
+	ticker := time.NewTicker(frameInterval)
 	defer ticker.Stop()
 
 	frameCount := 0
 
-	for cw.running {
+	for cw.running.Load() {
 		select {
 		case <-cw.stopCh:
 			return
 		case <-ticker.C:
-			if !cw.running {
+			if !cw.running.Load() {
 				return
 			}
 
@@ -56,7 +58,7 @@ func (cw *CaptureWorker) captureRealCamera() {
 
 // generateRealisticFrame generates more realistic test patterns
 func (cw *CaptureWorker) generateRealisticFrame(frameNum int) image.Image {
-	width, height := 640, 480
+	width, height := CameraWidth, CameraHeight
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
 
 	// Create more realistic patterns based on camera ID

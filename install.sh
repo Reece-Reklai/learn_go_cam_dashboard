@@ -1,192 +1,225 @@
 #!/bin/bash
-
-# Installation script for Camera Dashboard Go
-# Installs dependencies and sets up the application
+#
+# Camera Dashboard Installer
+# Installs dependencies and the pre-built camera-dashboard binary
+#
+# Usage:
+#   ./install.sh          # Install with prompts
+#   ./install.sh --yes    # Install without prompts (auto-yes)
+#
 
 set -e
 
-echo "🎥 Camera Dashboard Go - Installation Script"
-echo "============================================"
+APP_NAME="camera-dashboard"
+INSTALL_DIR="/usr/local/bin"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AUTO_YES=false
 
-# Function to check if running on Linux
-check_linux() {
-    if [[ "$OSTYPE" != "linux-gnu"* ]]; then
-        echo "❌ This application is designed for Linux systems"
+# Parse arguments
+if [ "$1" = "--yes" ] || [ "$1" = "-y" ]; then
+    AUTO_YES=true
+fi
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+echo "======================================"
+echo "  Camera Dashboard Installer"
+echo "======================================"
+echo ""
+
+# Check if running on Linux ARM64
+check_platform() {
+    echo -n "Checking platform... "
+    ARCH=$(uname -m)
+    OS=$(uname -s)
+    
+    if [ "$OS" != "Linux" ]; then
+        echo -e "${RED}FAILED${NC}"
+        echo "Error: This installer only supports Linux (detected: $OS)"
         exit 1
     fi
-}
-
-# Function to install Go dependencies
-install_go() {
-    echo "📦 Installing Go dependencies..."
     
-    if ! command -v go &> /dev/null; then
-        echo "❌ Go is not installed. Please install Go 1.21 or later"
-        echo "   On Ubuntu/Debian: sudo apt install golang-go"
-        echo "   On Raspberry Pi: sudo apt install golang-go"
+    if [ "$ARCH" != "aarch64" ] && [ "$ARCH" != "arm64" ]; then
+        echo -e "${RED}FAILED${NC}"
+        echo "Error: This binary requires 64-bit ARM (aarch64)"
+        echo "Detected: $ARCH"
+        echo ""
+        echo "If you're on 32-bit Pi OS, rebuild from source:"
+        echo "  make build"
         exit 1
     fi
     
-    echo "✅ Go version: $(go version)"
+    echo -e "${GREEN}OK${NC} (Linux $ARCH)"
 }
 
-# Function to install system dependencies
-install_system_deps() {
-    echo "📦 Installing system dependencies..."
+# Check for display server
+check_display() {
+    echo -n "Checking display server... "
     
-    if command -v apt-get &> /dev/null; then
-        # Ubuntu/Debian/Raspberry Pi
-        echo "   Using apt-get package manager..."
-        
-        # Update package list
-        sudo apt-get update
-        
-        # Install basic dependencies
-        sudo apt-get install -y \
-            pkg-config \
-            libgl1-mesa-dev \
-            xorg-dev \
-            libasound2-dev \
-            pulseaudio \
-            pulseaudio-utils
-            
-        # Install video4linux utilities for camera testing
-        sudo apt-get install -y v4l-utils
-        
-        # Install FFmpeg for camera capture
-        sudo apt-get install -y ffmpeg
-        
-        # Note: OpenCV support can be added with:
-        # sudo apt-get install -y libopencv-dev pkg-config
-        
-        echo "✅ System dependencies installed"
-        
-    elif command -v yum &> /dev/null; then
-        echo "   Using yum package manager..."
-        sudo yum install -y pkgconfig mesa-libGL-devel alsa-lib-devel
-        echo "✅ System dependencies installed"
-        
+    if [ -z "$DISPLAY" ] && [ -z "$WAYLAND_DISPLAY" ]; then
+        if [ -e "/tmp/.X11-unix/X0" ]; then
+            echo -e "${GREEN}OK${NC} (X11 available at :0)"
+        else
+            echo -e "${YELLOW}WARNING${NC}"
+            echo "  No display detected. You need a desktop environment."
+            echo "  Run with: DISPLAY=:0 $APP_NAME"
+        fi
+    elif [ -n "$WAYLAND_DISPLAY" ]; then
+        echo -e "${YELLOW}WAYLAND${NC}"
+        echo "  Wayland detected. App works best with X11."
     else
-        echo "⚠️  Could not detect package manager. Please install manually:"
-        echo "   - pkg-config"
-        echo "   - OpenGL development libraries"
-        echo "   - ALSA development libraries"
-        echo "   - v4l-utils (for camera testing)"
+        echo -e "${GREEN}OK${NC} (DISPLAY=$DISPLAY)"
     fi
 }
 
-# Function to setup permissions
-setup_permissions() {
-    echo "🔧 Setting up camera permissions..."
+# Check/install dependencies
+install_dependencies() {
+    echo ""
+    echo "Checking dependencies..."
     
-    # Add user to video group for camera access
-    if ! groups $USER | grep -q "video"; then
-        echo "   Adding $USER to video group..."
-        sudo usermod -a -G video $USER
-        echo "   ⚠️  You may need to log out and log back in for camera permissions to take effect"
+    MISSING=""
+    
+    echo -n "  ffmpeg: "
+    if command -v ffmpeg &> /dev/null; then
+        VERSION=$(ffmpeg -version 2>&1 | head -1 | cut -d' ' -f3)
+        echo -e "${GREEN}OK${NC} ($VERSION)"
+    else
+        echo -e "${RED}MISSING${NC}"
+        MISSING="$MISSING ffmpeg"
     fi
     
-    # Create udev rules for camera devices (optional)
-    if [ ! -f /etc/udev/rules.d/99-camera-dashboard.rules ]; then
-        echo "   Creating udev rules for camera devices..."
-        sudo tee /etc/udev/rules.d/99-camera-dashboard.rules > /dev/null <<EOF
-# Camera Dashboard - USB Camera Rules
-KERNEL=="video[0-9]*", SUBSYSTEM=="video4linux", MODE="0664", GROUP="video"
-EOF
+    echo -n "  v4l2-ctl: "
+    if command -v v4l2-ctl &> /dev/null; then
+        echo -e "${GREEN}OK${NC}"
+    else
+        echo -e "${RED}MISSING${NC}"
+        MISSING="$MISSING v4l-utils"
+    fi
+    
+    if [ -n "$MISSING" ]; then
+        echo ""
+        echo "Missing packages:$MISSING"
         
-        # Reload udev rules
-        sudo udevadm control --reload-rules
-        sudo udevadm trigger
+        if [ "$AUTO_YES" = true ]; then
+            REPLY="y"
+        else
+            read -p "Install missing packages? [Y/n] " -n 1 -r
+            echo
+        fi
+        
+        if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then
+            echo "Installing packages..."
+            sudo apt update
+            sudo apt install -y $MISSING
+            echo -e "${GREEN}Dependencies installed${NC}"
+        else
+            echo -e "${YELLOW}Skipping - app may not work without dependencies${NC}"
+        fi
+    else
+        echo -e "${GREEN}All dependencies present${NC}"
+    fi
+}
+
+# Find and install the binary
+install_binary() {
+    echo ""
+    echo "Installing $APP_NAME..."
+    
+    # Find the binary (check multiple locations)
+    BINARY=""
+    for loc in "$SCRIPT_DIR/$APP_NAME" "$SCRIPT_DIR/release/$APP_NAME"; do
+        if [ -f "$loc" ] && [ -x "$loc" ]; then
+            BINARY="$loc"
+            break
+        fi
+    done
+    
+    if [ -z "$BINARY" ]; then
+        echo -e "${RED}Error: $APP_NAME binary not found${NC}"
+        echo ""
+        echo "Expected locations:"
+        echo "  $SCRIPT_DIR/$APP_NAME"
+        echo "  $SCRIPT_DIR/release/$APP_NAME"
+        echo ""
+        echo "Build first with: make build"
+        exit 1
     fi
     
-    echo "✅ Camera permissions configured"
+    # Verify it's an ARM64 binary
+    FILE_TYPE=$(file "$BINARY" 2>/dev/null || echo "unknown")
+    if ! echo "$FILE_TYPE" | grep -q "aarch64\|ARM aarch64"; then
+        echo -e "${YELLOW}Warning: Binary may not be ARM64${NC}"
+        echo "  $FILE_TYPE"
+    fi
+    
+    echo "  From: $BINARY"
+    echo "  To:   $INSTALL_DIR/$APP_NAME"
+    
+    sudo cp "$BINARY" "$INSTALL_DIR/$APP_NAME"
+    sudo chmod +x "$INSTALL_DIR/$APP_NAME"
+    
+    echo -e "${GREEN}Binary installed${NC}"
+    
+    # Show version
+    echo ""
+    "$INSTALL_DIR/$APP_NAME" -version 2>/dev/null || true
 }
 
-# Function to build the application
-build_app() {
-    echo "🔨 Building Camera Dashboard..."
+# Add user to video group if needed
+setup_permissions() {
+    echo ""
+    echo -n "Checking camera permissions... "
     
-    # Download dependencies
-    echo "   Downloading Go modules..."
-    go mod tidy
-    
-    # Build the application
-    echo "   Compiling application..."
-    go build -o camera-dashboard .
-    
-    # Make executable
-    chmod +x camera-dashboard
-    
-    echo "✅ Build complete: ./camera-dashboard"
+    if groups $USER | grep -q "video"; then
+        echo -e "${GREEN}OK${NC} (user in video group)"
+    else
+        echo -e "${YELLOW}ADDING${NC}"
+        sudo usermod -a -G video $USER
+        echo "  Added $USER to video group"
+        echo "  NOTE: Log out and back in for this to take effect"
+    fi
 }
 
-# Function to test camera devices
-test_cameras() {
-    echo "📷 Testing camera devices..."
+# Detect cameras
+detect_cameras() {
+    echo ""
+    echo "Detecting cameras..."
     
     if command -v v4l2-ctl &> /dev/null; then
-        for device in /dev/video*; do
-            if [ -e "$device" ]; then
-                echo "   Testing $device..."
-                if v4l2-ctl --device="$device" --info &> /dev/null; then
-                    echo "   ✅ $device is accessible"
-                else
-                    echo "   ❌ $device is not accessible"
-                fi
-            fi
-        done
-    else
-        echo "   ⚠️  v4l2-ctl not available - skipping camera tests"
-        echo "   Install with: sudo apt-get install v4l-utils"
+        USB_CAMS=$(v4l2-ctl --list-devices 2>/dev/null | grep -B1 "USB" | grep -A1 "USB" | grep "/dev/video" | head -5 || true)
+        if [ -n "$USB_CAMS" ]; then
+            echo -e "${GREEN}Found USB cameras:${NC}"
+            echo "$USB_CAMS" | while read dev; do
+                echo "  $dev"
+            done
+        else
+            echo -e "${YELLOW}No USB cameras detected${NC}"
+            echo "  Connect USB cameras before running the app"
+        fi
     fi
 }
 
-# Function to create desktop entry
-create_desktop_entry() {
-    echo "🖥️  Creating desktop entry..."
-    
-    DESKTOP_DIR="$HOME/.local/share/applications"
-    mkdir -p "$DESKTOP_DIR"
-    
-    cat > "$DESKTOP_DIR/camera-dashboard-go.desktop" <<EOF
-[Desktop Entry]
-Version=1.0
-Type=Application
-Name=Camera Dashboard Go
-Comment=Multi-camera monitoring dashboard
-Exec=$(pwd)/camera-dashboard
-Icon=camera-video
-Terminal=false
-Categories=Video;AudioVideo;
-EOF
-    
-    echo "✅ Desktop entry created"
-}
-
-# Main installation function
+# Main
 main() {
-    echo "Starting installation..."
-    echo ""
-    
-    check_linux
-    install_go
-    install_system_deps
+    check_platform
+    check_display
+    install_dependencies
+    install_binary
     setup_permissions
-    build_app
-    test_cameras
-    create_desktop_entry
+    detect_cameras
     
     echo ""
-    echo "🎉 Installation complete!"
+    echo "======================================"
+    echo -e "${GREEN}  Installation Complete!${NC}"
+    echo "======================================"
     echo ""
-    echo "To run the application:"
-    echo "   ./camera-dashboard"
-    echo ""
-    echo "Or find it in your applications menu as 'Camera Dashboard Go'"
-    echo ""
-    echo "If camera permissions don't work, log out and log back in"
+    echo "To run:"
+    echo "  DISPLAY=:0 camera-dashboard"
     echo ""
 }
 
-# Run main function
-main
+main "$@"

@@ -1,220 +1,145 @@
-# Camera Dashboard Go
+# Camera Dashboard
 
-A high-performance multi-camera monitoring system written in Go, designed for Raspberry Pi and Linux systems. This is a Go rewrite of the original Python/PyQt6 camera dashboard, offering better performance and easier deployment.
+A high-performance multi-camera monitoring system for Raspberry Pi, designed for vehicle use (rear camera, blind spot monitoring). Built with Go and the Fyne GUI framework.
 
 ## Features
 
-- **Multi-Camera Support**: Automatically detects and displays up to 3 USB cameras simultaneously
-- **Real-time Video**: High-performance video streaming with adaptive FPS control
-- **Touch-Enabled Interface**: Optimized for touch screens with gesture support
-- **Fullscreen Mode**: Click any camera to view in fullscreen
-- **Performance Monitoring**: Adaptive performance based on CPU load and temperature
-- **Cross-Platform**: Runs on any Linux system with minimal dependencies
-- **Single Binary**: No Python environment required
+- **Multi-Camera Support** - Up to 3 USB cameras in a 2x2 grid layout
+- **Real-time Video** - 640x480 @ 15 FPS, optimized for vehicle monitoring
+- **Touch Interface** - Tap for fullscreen, long-press to swap camera positions
+- **Hot-plug Detection** - Cameras auto-detect when connected/disconnected
+- **Low Power** - Optimized for battery-powered operation (~100% CPU for 2 cameras)
+- **Single Binary** - No Python, no runtime dependencies
 
 ## Quick Start
 
-### Prerequisites
+### On a Raspberry Pi (64-bit OS)
 
-- Go 1.21 or later
-- Linux system (Ubuntu, Debian, Raspberry Pi OS recommended)
-- USB cameras (connected to `/dev/video*` devices)
+```bash
+# Download and extract
+tar -xzvf camera-dashboard-*.tar.gz
 
-### Installation
+# Install (installs dependencies + binary)
+./install.sh
 
-1. **Clone and Install**:
-   ```bash
-   git clone <repository-url>
-   cd camera-dashboard-go
-   ./install-go.sh
-   ```
+# Run
+DISPLAY=:0 camera-dashboard
+```
 
-2. **Manual Installation** (if script fails):
-   ```bash
-   # Install system dependencies
-   sudo apt-get update
-   sudo apt-get install -y pkg-config libgl1-mesa-dev xorg-dev libasound2-dev v4l-utils
-   
-   # Add user to video group for camera access
-   sudo usermod -a -G video $USER
-   # Log out and log back in for permissions to take effect
-   
-   # Build and run
-   go mod tidy
-   go build -o camera-dashboard .
-   ./camera-dashboard
-   ```
+### Build from Source
 
-### Running
+```bash
+# Install dependencies
+sudo apt install ffmpeg v4l-utils
 
-- **From terminal**: `./camera-dashboard`
-- **From applications menu**: Look for "Camera Dashboard Go"
+# Build
+make build
+
+# Run
+make run
+```
+
+## Requirements
+
+| Requirement | Details |
+|-------------|---------|
+| **OS** | Raspberry Pi OS (64-bit) or Ubuntu ARM64 |
+| **Hardware** | Raspberry Pi 3/4/5 |
+| **Display** | X11 desktop environment |
+| **Cameras** | USB cameras with V4L2 support |
+| **Dependencies** | ffmpeg, v4l-utils |
 
 ## Usage
 
-### Interface Controls
+| Action | Result |
+|--------|--------|
+| **Tap camera** | Fullscreen view |
+| **Tap fullscreen** | Exit fullscreen |
+| **Long-press camera** | Enter swap mode |
+| **Tap another slot** | Swap positions |
+| **Restart button** | Reinitialize cameras |
+| **Exit button** | Clean shutdown |
 
-- **Short Click**: Enter fullscreen mode for that camera
-- **Right Click**: Alternative fullscreen trigger
-- **Settings Tile**: Top-left corner (planned feature)
+## Configuration
 
-### Camera Layout
+Edit `internal/camera/config.go` to change settings:
 
-The application automatically arranges cameras:
-- 1 camera: Full screen
-- 2 cameras: Side by side
-- 3 cameras: Two on top, one on bottom
-
-### Performance
-
-The application includes automatic performance optimization:
-- Monitors CPU load and temperature
-- Reduces FPS when system is under stress
-- Gradually recovers when system stabilizes
-- Minimum 5 FPS maintained for usability
-
-## Architecture
-
-### Technology Stack
-
-- **GUI**: Fyne v2 (Go-native, GPU-accelerated)
-- **Video**: Camera capture with realistic simulation patterns
-- **Performance**: Real-time system monitoring
-- **Deployment**: Single static binary
-- **Future**: FFmpeg/OpenCV integration ready
-
-### Project Structure
-
-```
-camera-dashboard-go/
-├── main.go                     # Application entry point
-├── go.mod                      # Go module dependencies
-├── install-go.sh              # Installation script
-└── internal/
-    ├── camera/                 # Camera management
-    │   ├── device.go          # Camera discovery
-    │   ├── capture.go         # Video capture
-    │   └── manager.go        # Multi-camera orchestrator
-    ├── ui/                    # User interface
-    │   ├── app.go            # Main application
-    │   ├── camera.go         # Camera widget
-    │   └── grid.go          # Layout management
-    └── perf/                  # Performance monitoring
-        ├── monitor.go         # System metrics
-        └── adaptive.go        # Adaptive performance control
+```go
+const (
+    CameraWidth  = 640   // Resolution width
+    CameraHeight = 480   // Resolution height
+    CameraFPS    = 15    // Frames per second
+    CameraFormat = "mjpeg" // or "yuyv"
+)
 ```
 
-## Development
+Then rebuild: `make build`
 
-### Building from Source
+## Makefile Targets
 
 ```bash
-# Clone the repository
-git clone <repository-url>
-cd camera-dashboard-go
-
-# Download dependencies
-go mod tidy
-
-# Build
-go build -o camera-dashboard .
-
-# Run
-./camera-dashboard
+make build      # Development build
+make release    # Optimized build
+make package    # Create deployment tarball
+make run        # Build and run
+make status     # Show CPU/temp/memory
+make clean      # Remove build artifacts
+make help       # Show all targets
 ```
 
-### Dependencies
+## Project Structure
 
-- `fyne.io/fyne/v2`: GUI framework
-- `github.com/shirou/gopsutil/v3`: System monitoring
-
-### Testing Cameras
-
-Use v4l-utils to test camera access:
-
-```bash
-# List available cameras
-v4l2-ctl --list-devices
-
-# Test a specific camera
-v4l2-ctl --device=/dev/video0 --info
-
-# Stream test (requires v4l2-loopback)
-ffmpeg -f v4l2 -i /dev/video0 -f null -
 ```
-
-## Performance
-
-### Expected Performance (Raspberry Pi 4/5)
-
-| Cameras | Resolution | Expected FPS | CPU Usage | Memory |
-|---------|------------|---------------|-----------|---------|
-| 1 | 640x480 | 25-30 | 12% | 80MB |
-| 2 | 640x480 | 18-22 | 28% | 140MB |
-| 3 | 640x480 | 12-15 | 42% | 200MB |
-
-### Optimization Features
-
-- **Latest-frame-only buffers** to prevent memory accumulation
-- **Adaptive FPS** based on system load
-- **GPU acceleration** via Fyne
-- **Efficient goroutine management**
+.
+├── main.go                 # Entry point, signal handling
+├── internal/
+│   ├── camera/
+│   │   ├── config.go       # Resolution/FPS settings
+│   │   ├── manager.go      # Camera lifecycle management
+│   │   ├── capture.go      # FFmpeg capture, frame decoding
+│   │   ├── framebuffer.go  # Lock-free frame buffer
+│   │   └── device.go       # Camera discovery
+│   ├── ui/
+│   │   ├── app.go          # Fyne application, UI setup
+│   │   ├── camera.go       # Camera widget
+│   │   └── grid.go         # Grid layout
+│   └── perf/
+│       ├── adaptive.go     # Performance controller
+│       └── monitor.go      # CPU/temperature monitoring
+├── Makefile                # Build system
+├── install.sh              # Deployment installer
+└── LEARN.md                # Technical deep-dive
+```
 
 ## Troubleshooting
 
-### Common Issues
+### No cameras detected
+```bash
+v4l2-ctl --list-devices  # Check if cameras are visible
+ls -la /dev/video*       # Check device files
+sudo usermod -a -G video $USER  # Add user to video group
+```
 
-1. **Cameras not detected**:
-   - Check camera permissions: `groups $USER | grep video`
-   - Verify devices: `ls -l /dev/video*`
-   - Test with v4l2-ctl
+### High CPU usage
+- Reduce FPS in `config.go` (try 10 FPS)
+- Use MJPEG format (not YUYV)
+- Check for zombie processes: `ps aux | awk '$8 == "Z"'`
 
-2. **Permission denied**:
-   - Log out and log back in after adding to video group
-   - Check udev rules in `/etc/udev/rules.d/99-camera-dashboard.rules`
-
-3. **High CPU usage**:
-   - Check that adaptive performance is working
-   - Reduce number of cameras
-   - Lower resolution settings
-
-4. **Application won't start**:
-   - Verify Go version: `go version`
-   - Check OpenGL support: `glxinfo | grep OpenGL`
-   - Install missing system dependencies
-
-### Logs
-
-The application provides status information in the window title bar and status area.
-
-## Comparison with Python Version
-
-| Feature | Python/PyQt6 | Go/Fyne | Improvement |
-|---------|---------------|----------|-------------|
-| Startup Time | 3-5 seconds | <1 second | 5x faster |
-| Memory Usage | 300-800MB | 200-400MB | 50% reduction |
-| CPU Usage | 50-70% | 30-50% | 30% reduction |
-| Deployment | Python + packages | Single binary | Much simpler |
-| Installation | Complex | Simple script | Easier |
-
-## Future Enhancements
-
-- [ ] Real camera capture integration (GStreamer/OpenCV)
-- [ ] Camera settings controls
-- [ ] Recording functionality
-- [ ] Network camera support (IP cameras)
-- [ ] Configuration persistence
-- [ ] Touch gesture refinement
-- [ ] Performance metrics dashboard
+### Display issues
+```bash
+echo $DISPLAY  # Should be :0
+DISPLAY=:0 camera-dashboard  # Set explicitly
+```
 
 ## License
 
-MIT License - See LICENSE file for details.
+MIT License - see LICENSE.MIT
 
-## Contributing
+## Learn More
 
-Contributions are welcome! Please fork and submit pull requests.
-
-## Support
-
-For issues and questions, please use the GitHub issue tracker.
+See [LEARN.md](LEARN.md) for a comprehensive technical deep-dive into:
+- Concurrency patterns (goroutines, channels, atomics)
+- Lock-free data structures (FrameBuffer)
+- FFmpeg integration and MJPEG streaming
+- GUI architecture with Fyne
+- Performance optimization techniques

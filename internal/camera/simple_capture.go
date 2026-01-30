@@ -12,7 +12,9 @@ import (
 func (cw *CaptureWorker) captureSimpleCamera() {
 	fmt.Printf("Starting camera capture for %s\n", cw.camera.DeviceID)
 
-	ticker := time.NewTicker(33 * time.Millisecond) // ~30 FPS
+	// Use FPS from config.go
+	frameInterval := time.Second / time.Duration(CameraFPS)
+	ticker := time.NewTicker(frameInterval)
 	defer ticker.Stop()
 
 	frameCount := 0
@@ -25,7 +27,7 @@ func (cw *CaptureWorker) captureSimpleCamera() {
 		case <-cw.stopCh:
 			return
 		case <-ticker.C:
-			if !cw.running {
+			if !cw.running.Load() {
 				return
 			}
 
