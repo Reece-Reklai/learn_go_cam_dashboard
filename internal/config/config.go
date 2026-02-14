@@ -18,6 +18,9 @@ import (
 // Config holds all runtime configuration values.
 type Config struct {
 	// Logging
+	// LogLevel is parsed from the INI file but currently unused because Go's
+	// standard log package does not support levelled logging. Retained for
+	// forward-compatibility if a levelled logger (e.g. slog) is adopted.
 	LogLevel       string
 	LogFile        string
 	LogMaxBytes    int
@@ -49,6 +52,7 @@ type Config struct {
 	CaptureWidth  int
 	CaptureHeight int
 	CaptureFPS    int
+	CaptureFormat string // "mjpeg" or "yuyv"; passed to FFmpeg as -input_format
 	UIFPS         int
 
 	// Health
@@ -82,7 +86,7 @@ func DefaultConfig() *Config {
 		MinDynamicFPS:        10,
 		MinDynamicUIFPS:      12,
 		UIFPSStep:            2,
-		CPULoadThreshold:     0.75,
+		CPULoadThreshold:     3.0,
 		CPUTempThresholdC:    75.0,
 		StressHoldCount:      3,
 		RecoverHoldCount:     3,
@@ -101,6 +105,7 @@ func DefaultConfig() *Config {
 		CaptureWidth:  640,
 		CaptureHeight: 480,
 		CaptureFPS:    25,
+		CaptureFormat: "mjpeg",
 		UIFPS:         20,
 
 		// Health
@@ -320,7 +325,7 @@ func applyINI(cfg *Config, ini iniData) {
 			cfg.UIFPSStep = asInt(v, cfg.UIFPSStep, intPtr(1), nil)
 		}
 		if v, ok := ini.get("performance", "cpu_load_threshold"); ok {
-			cfg.CPULoadThreshold = asFloat(v, cfg.CPULoadThreshold, floatPtr(0.1), floatPtr(1.0))
+			cfg.CPULoadThreshold = asFloat(v, cfg.CPULoadThreshold, floatPtr(0.1), floatPtr(20.0))
 		}
 		if v, ok := ini.get("performance", "cpu_temp_threshold_c"); ok {
 			cfg.CPUTempThresholdC = asFloat(v, cfg.CPUTempThresholdC, floatPtr(30.0), floatPtr(100.0))
@@ -371,6 +376,12 @@ func applyINI(cfg *Config, ini iniData) {
 		}
 		if v, ok := ini.get("profile", "capture_fps"); ok {
 			cfg.CaptureFPS = asInt(v, cfg.CaptureFPS, intPtr(1), intPtr(60))
+		}
+		if v, ok := ini.get("profile", "capture_format"); ok {
+			v = strings.ToLower(strings.TrimSpace(v))
+			if v == "mjpeg" || v == "yuyv" {
+				cfg.CaptureFormat = v
+			}
 		}
 		if v, ok := ini.get("profile", "ui_fps"); ok {
 			cfg.UIFPS = asInt(v, cfg.UIFPS, intPtr(1), intPtr(60))

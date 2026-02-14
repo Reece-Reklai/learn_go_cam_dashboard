@@ -5,11 +5,13 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 // Monitor tracks system performance metrics
 type Monitor struct {
+	mu          sync.RWMutex
 	lastCheck   time.Time
 	loadAvg     float64
 	temperature float64
@@ -25,6 +27,9 @@ func NewMonitor() *Monitor {
 
 // UpdateStats updates performance statistics
 func (m *Monitor) UpdateStats() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	// Update CPU load
 	if err := m.updateLoadAverage(); err != nil {
 		return err
@@ -97,16 +102,22 @@ func (m *Monitor) updateTemperature() error {
 
 // GetLoadAverage returns current load average
 func (m *Monitor) GetLoadAverage() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.loadAvg
 }
 
 // GetTemperature returns current temperature in Celsius
 func (m *Monitor) GetTemperature() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.temperature
 }
 
 // GetMemoryUsage returns memory usage percentage (0-100)
 func (m *Monitor) GetMemoryUsage() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.memoryUsage
 }
 
@@ -143,6 +154,8 @@ func (m *Monitor) updateMemoryUsage() error {
 
 // IsUnderStress returns true if system is under stress
 func (m *Monitor) IsUnderStress() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.loadAvg > 1.5 || m.temperature > 70.0
 }
 

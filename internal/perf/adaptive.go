@@ -188,7 +188,7 @@ func (sc *SmartController) controlLoop() {
 		interval = 250 * time.Millisecond
 	}
 
-	ticker := time.NewTicker(1 * time.Second) // Tick every second for responsiveness
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	logTicker := time.NewTicker(5 * time.Second)
@@ -463,8 +463,7 @@ func (sc *SmartController) enterState(state int) {
 	sc.stressCount = 0
 	sc.recoverCount = 0
 
-	names := []string{"Probing", "Stable", "Recovering", "Emergency"}
-	log.Printf("[SmartCtrl] State: %s -> %s", names[oldState], names[state])
+	log.Printf("[SmartCtrl] State: %s -> %s", stateName(oldState), stateName(int32(state)))
 
 	if state == StateEmergency {
 		sc.applyFPS(sc.minFPS)
@@ -508,8 +507,7 @@ func (sc *SmartController) GetSweetSpotFPS() int {
 
 // GetState returns current state name
 func (sc *SmartController) GetState() string {
-	names := []string{"Probing", "Stable", "Recovering", "Emergency"}
-	return names[sc.state.Load()]
+	return stateName(sc.state.Load())
 }
 
 // IsDynamic returns whether dynamic FPS adaptation is enabled
@@ -517,7 +515,17 @@ func (sc *SmartController) IsDynamic() bool {
 	return sc.dynamicEnabled
 }
 
-// Legacy compatibility
+// stateNames maps state constants to human-readable names.
+var stateNames = []string{"Probing", "Stable", "Recovering", "Emergency"}
+
+// stateName returns the name for a state value, or "Unknown" if out of range.
+func stateName(state int32) string {
+	if state >= 0 && int(state) < len(stateNames) {
+		return stateNames[state]
+	}
+	return "Unknown"
+}
+
 type AdaptiveController = SmartController
 
 func NewAdaptiveController(manager *camera.Manager, cfg *config.Config) *AdaptiveController {

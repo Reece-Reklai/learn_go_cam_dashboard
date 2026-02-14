@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 )
 
@@ -29,7 +30,7 @@ func main() {
 		fmt.Printf("Camera Dashboard %s\n", Version)
 		fmt.Printf("  Build time: %s\n", BuildTime)
 		fmt.Printf("  Go version: %s\n", GoVersion)
-		fmt.Printf("  Platform:   linux/arm64 (Raspberry Pi)\n")
+		fmt.Printf("  Platform:   %s/%s\n", runtime.GOOS, runtime.GOARCH)
 		os.Exit(0)
 	}
 

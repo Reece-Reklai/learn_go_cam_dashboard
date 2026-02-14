@@ -2,6 +2,7 @@
 package helpers
 
 import (
+	"context"
 	"log"
 	"os"
 	"os/exec"
@@ -122,9 +123,11 @@ func isPIDAlive(pid int) bool {
 }
 
 // runCmd executes a command with a 2-second timeout and returns stdout.
-// Errors are silently ignored (returns empty string).
+// Errors (including timeout) are silently ignored (returns empty string).
 func runCmd(name string, args ...string) string {
-	cmd := exec.Command(name, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Env = os.Environ()
 	out, err := cmd.Output()
 	if err != nil {

@@ -2,7 +2,6 @@ package camera
 
 import (
 	"fmt"
-	"image"
 	"log"
 	"sync"
 	"time"
@@ -10,34 +9,12 @@ import (
 
 // Manager manages multiple cameras and capture workers
 type Manager struct {
-	cameras       []Camera
-	workers       []*CaptureWorker
-	frameChannels map[string]chan image.Image // Legacy channel mode
-	frameBuffers  map[string]*FrameBuffer     // New buffer mode (preferred)
-	useBufferMode bool                        // If true, use FrameBuffer instead of channels
-	settings      Settings                    // Camera capture settings from config
-	running       bool
-	mutex         sync.RWMutex
-}
-
-// NewManager creates a new camera manager (legacy channel mode)
-func NewManager() *Manager {
-	return &Manager{
-		frameChannels: make(map[string]chan image.Image),
-		frameBuffers:  make(map[string]*FrameBuffer),
-		useBufferMode: false,
-		settings:      DefaultSettings(),
-	}
-}
-
-// NewManagerWithBuffers creates a manager using FrameBuffer mode (recommended)
-func NewManagerWithBuffers() *Manager {
-	return &Manager{
-		frameChannels: make(map[string]chan image.Image),
-		frameBuffers:  make(map[string]*FrameBuffer),
-		useBufferMode: true,
-		settings:      DefaultSettings(),
-	}
+	cameras      []Camera
+	workers      []*CaptureWorker
+	frameBuffers map[string]*FrameBuffer // Buffer mode for decoupled capture/render
+	settings     Settings                // Camera capture settings from config
+	running      bool
+	mutex        sync.RWMutex
 }
 
 // NewManagerWithSettings creates a manager with explicit settings from config
@@ -57,10 +34,8 @@ func NewManagerWithSettings(s Settings, useBuffers bool) *Manager {
 	}
 
 	return &Manager{
-		frameChannels: make(map[string]chan image.Image),
-		frameBuffers:  make(map[string]*FrameBuffer),
-		useBufferMode: useBuffers,
-		settings:      s,
+		frameBuffers: make(map[string]*FrameBuffer),
+		settings:     s,
 	}
 }
 
@@ -69,7 +44,10 @@ func (m *Manager) GetSettings() Settings {
 	return m.settings
 }
 
-// Initialize discovers and initializes cameras
+// Initialize discovers and initializes cameras.
+// Must not be called concurrently — the caller (initializeCamerasAsync) ensures
+// single-threaded access during startup, and handleNewCameraDevice serializes
+// via reinitLock.
 func (m *Manager) Initialize() error {
 	log.Println("[Manager] Stopping existing workers...")
 	// Stop existing workers (without holding mutex - stopInternal handles its own locking)
@@ -89,28 +67,16 @@ func (m *Manager) Initialize() error {
 	log.Printf("[Manager] Found %d cameras", len(cameras))
 	m.cameras = cameras
 	m.workers = make([]*CaptureWorker, len(cameras))
-	m.frameChannels = make(map[string]chan image.Image)
 	m.frameBuffers = make(map[string]*FrameBuffer)
 
 	// Create capture workers for each camera
 	for i, camera := range cameras {
-		log.Printf("[Manager] Creating worker for camera %s (%s) [buffer mode: %v]",
-			camera.DeviceID, camera.DevicePath, m.useBufferMode)
+		log.Printf("[Manager] Creating worker for camera %s (%s)",
+			camera.DeviceID, camera.DevicePath)
 
-		var worker *CaptureWorker
-
-		if m.useBufferMode {
-			// New FrameBuffer mode - decoupled capture from UI
-			buffer := NewFrameBuffer()
-			worker = NewCaptureWorkerWithBuffer(camera, buffer, m.settings)
-			m.frameBuffers[camera.DeviceID] = buffer
-		} else {
-			// Legacy channel mode
-			frameCh := make(chan image.Image, 1) // Latest-frame-only buffer
-			worker = NewCaptureWorker(camera, frameCh, m.settings)
-			m.frameChannels[camera.DeviceID] = frameCh
-		}
-
+		buffer := NewFrameBuffer()
+		worker := NewCaptureWorkerWithBuffer(camera, buffer, m.settings)
+		m.frameBuffers[camera.DeviceID] = buffer
 		m.workers[i] = worker
 	}
 
@@ -120,12 +86,13 @@ func (m *Manager) Initialize() error {
 }
 
 // Start starts all camera capture workers with staggered timing
-// to reduce USB bandwidth contention during initialization
+// to reduce USB bandwidth contention during initialization.
+// The mutex is released during the 500ms sleep between cameras so that
+// UI calls (GetFrameBuffer, GetCameras) are not blocked during init.
 func (m *Manager) Start() error {
 	m.mutex.Lock()
-	defer m.mutex.Unlock()
-
 	if !m.running {
+		m.mutex.Unlock()
 		return ErrManagerNotInitialized
 	}
 
@@ -134,17 +101,27 @@ func (m *Manager) Start() error {
 	// simultaneously causes buffer overruns on some cameras
 	for i, worker := range m.workers {
 		if i > 0 {
-			// Wait 500ms between camera starts to allow USB subsystem to stabilize
+			// Release lock during sleep so UI can call GetFrameBuffer/GetCameras
+			m.mutex.Unlock()
 			log.Printf("[Manager] Waiting 500ms before starting camera %d to reduce USB contention", i+1)
 			time.Sleep(500 * time.Millisecond)
+			m.mutex.Lock()
+
+			// Re-check running state after reacquiring lock
+			if !m.running {
+				m.mutex.Unlock()
+				return ErrManagerNotInitialized
+			}
 		}
 
 		if err := worker.Start(); err != nil {
+			m.mutex.Unlock()
 			return err
 		}
 		log.Printf("[Manager] Started camera %d/%d", i+1, len(m.workers))
 	}
 
+	m.mutex.Unlock()
 	return nil
 }
 
@@ -167,13 +144,7 @@ func (m *Manager) stopInternal() {
 		}
 	}
 
-	// Close all frame channels (legacy mode)
-	for _, ch := range m.frameChannels {
-		close(ch)
-	}
-
 	m.workers = nil
-	m.frameChannels = make(map[string]chan image.Image)
 	m.frameBuffers = make(map[string]*FrameBuffer)
 }
 
@@ -187,19 +158,7 @@ func (m *Manager) GetCameras() []Camera {
 	return cameras
 }
 
-// GetFrameChannel returns frame channel for a specific camera
-func (m *Manager) GetFrameChannel(cameraID string) <-chan image.Image {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-
-	if ch, exists := m.frameChannels[cameraID]; exists {
-		return ch
-	}
-
-	return nil
-}
-
-// GetFrameBuffer returns frame buffer for a specific camera (new mode)
+// GetFrameBuffer returns frame buffer for a specific camera
 func (m *Manager) GetFrameBuffer(cameraID string) *FrameBuffer {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
@@ -209,11 +168,6 @@ func (m *Manager) GetFrameBuffer(cameraID string) *FrameBuffer {
 	}
 
 	return nil
-}
-
-// IsBufferMode returns true if manager is using FrameBuffer mode
-func (m *Manager) IsBufferMode() bool {
-	return m.useBufferMode
 }
 
 // SetFPS sets the FPS for all capture workers
@@ -262,17 +216,19 @@ func (m *Manager) RestartCamera(cameraID string) error {
 	return worker.Restart()
 }
 
-// RestartCameraByIndex restarts only the camera at the specified index
-// Other cameras continue running uninterrupted
+// RestartCameraByIndex restarts only the camera at the specified index.
+// The mutex is released before calling Restart to avoid holding a read lock
+// while the worker blocks on Stop (which may take up to 2s).
 func (m *Manager) RestartCameraByIndex(index int) error {
 	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-
 	if index < 0 || index >= len(m.workers) {
+		m.mutex.RUnlock()
 		return fmt.Errorf("camera index %d out of range", index)
 	}
 
 	worker := m.workers[index]
+	m.mutex.RUnlock()
+
 	if worker == nil {
 		return fmt.Errorf("camera at index %d has no worker", index)
 	}

@@ -27,10 +27,7 @@ func GetSmartGrid(n int) (rows, cols int) {
 	default:
 		// 10+ cameras: cols = min(4, floor(sqrt(n) * 1.5))
 		// rows = ceil(n / cols)
-		cols = int(float64(n) * 1.5) // sqrt approximation below
-		// Actually use integer square root * 1.5
-		cols = isqrt(n)
-		cols = int(float64(cols) * 1.5)
+		cols = int(float64(isqrt(n)) * 1.5)
 		if cols > 4 {
 			cols = 4
 		}

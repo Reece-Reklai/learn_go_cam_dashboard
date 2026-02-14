@@ -4,24 +4,15 @@ import (
 	"bytes"
 	"fmt"
 	"image"
-	"image/color"
 	"image/jpeg"
 	"io"
 	"log"
 	"os/exec"
-	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 )
-
-// Resolution presets for adaptive scaling
-type Resolution struct {
-	Width  int
-	Height int
-	Label  string
-}
 
 // CaptureWorker handles camera capture in a goroutine
 type CaptureWorker struct {
@@ -31,9 +22,8 @@ type CaptureWorker struct {
 	stopCh   chan struct{}
 	wg       sync.WaitGroup // Tracks capture goroutine for clean shutdown
 
-	// Frame output - supports both channel and buffer modes
-	frameCh     chan<- image.Image // Legacy channel mode
-	frameBuffer *FrameBuffer       // New buffer mode (preferred)
+	// Frame output
+	frameBuffer *FrameBuffer // Buffer mode for decoupled capture/render
 
 	// FFmpeg capture
 	ffmpegCmd *exec.Cmd
@@ -53,133 +43,6 @@ type CaptureWorker struct {
 	frameCount    atomic.Uint64
 	errorCount    atomic.Uint32
 	skippedFrames atomic.Uint64
-
-	// Concurrent decode pipeline (optional)
-	decodePool *DecodePool
-	usePool    bool
-}
-
-// DecodePool manages concurrent JPEG decoding workers
-type DecodePool struct {
-	workers  int
-	inputCh  chan []byte
-	outputCh chan image.Image
-	running  atomic.Bool
-	wg       sync.WaitGroup
-}
-
-// NewDecodePool creates a pool of decoder workers
-func NewDecodePool(workers int) *DecodePool {
-	if workers <= 0 {
-		workers = runtime.NumCPU()
-	}
-	// Limit to 2 workers on Pi to avoid overwhelming CPU
-	if workers > 2 {
-		workers = 2
-	}
-
-	return &DecodePool{
-		workers:  workers,
-		inputCh:  make(chan []byte, 4),      // Small buffer for raw JPEG data
-		outputCh: make(chan image.Image, 2), // Decoded frames ready for consumption
-	}
-}
-
-// Start launches the decoder workers
-func (dp *DecodePool) Start() {
-	if dp.running.Swap(true) {
-		return
-	}
-
-	for i := 0; i < dp.workers; i++ {
-		dp.wg.Add(1)
-		go dp.decodeWorker(i)
-	}
-	log.Printf("[DecodePool] Started %d decoder workers", dp.workers)
-}
-
-// Stop halts all workers
-func (dp *DecodePool) Stop() {
-	if !dp.running.Swap(false) {
-		return
-	}
-	close(dp.inputCh)
-	dp.wg.Wait()
-	close(dp.outputCh)
-}
-
-// Submit sends raw JPEG data for decoding
-func (dp *DecodePool) Submit(data []byte) bool {
-	if !dp.running.Load() {
-		return false
-	}
-	select {
-	case dp.inputCh <- data:
-		return true
-	default:
-		return false // Pool is busy, drop frame
-	}
-}
-
-// GetOutput returns the channel for decoded frames
-func (dp *DecodePool) GetOutput() <-chan image.Image {
-	return dp.outputCh
-}
-
-// decodeWorker processes JPEG data
-func (dp *DecodePool) decodeWorker(id int) {
-	defer dp.wg.Done()
-
-	for data := range dp.inputCh {
-		if !dp.running.Load() {
-			return
-		}
-
-		// Decode JPEG - no RGBA conversion needed
-		img, err := jpeg.Decode(bytes.NewReader(data))
-		if err != nil {
-			continue
-		}
-
-		// Send to output directly (no conversion)
-		select {
-		case dp.outputCh <- img:
-		default:
-			// Output buffer full, drop this frame
-		}
-	}
-}
-
-// NewCaptureWorker creates a new capture worker for a camera (legacy channel mode)
-func NewCaptureWorker(camera Camera, frameCh chan<- image.Image, s Settings) *CaptureWorker {
-	capW := camera.Capabilities.MaxWidth
-	capH := camera.Capabilities.MaxHeight
-	capFPS := camera.Capabilities.MaxFPS
-
-	// Ensure we have valid defaults from settings
-	if capW == 0 {
-		capW = s.Width
-	}
-	if capH == 0 {
-		capH = s.Height
-	}
-	if capFPS == 0 {
-		capFPS = s.FPS
-	}
-
-	cw := &CaptureWorker{
-		camera:     camera,
-		settings:   s,
-		frameCh:    frameCh,
-		stopCh:     make(chan struct{}),
-		captureW:   capW,
-		captureH:   capH,
-		captureFPS: capFPS,
-		usePool:    false,
-	}
-	cw.targetFPS.Store(int32(capFPS))
-	log.Printf("[Capture] %s: Vehicle mode - %dx%d @ %d FPS (fixed)", camera.DeviceID, capW, capH, capFPS)
-	return cw
 }
 
 // NewCaptureWorkerWithBuffer creates a capture worker using FrameBuffer
@@ -207,9 +70,8 @@ func NewCaptureWorkerWithBuffer(camera Camera, buffer *FrameBuffer, s Settings) 
 		captureW:    capW,
 		captureH:    capH,
 		captureFPS:  capFPS,
-		usePool:     false,
 	}
-	cw.targetFPS.Store(int32(capFPS)) // Fixed FPS from config
+	cw.targetFPS.Store(int32(capFPS))
 	log.Printf("[Capture] %s: Vehicle mode - %dx%d @ %d FPS (buffer, fixed)", camera.DeviceID, capW, capH, capFPS)
 	return cw
 }
@@ -340,9 +202,11 @@ func (cw *CaptureWorker) GetStats() (frameCount uint64, fps float64, errors uint
 // falls back to test patterns which periodically try to reconnect
 func (cw *CaptureWorker) captureLoop() {
 	defer func() {
+		cw.ffmpegMu.Lock()
 		if cw.ffmpegCmd != nil && cw.ffmpegCmd.Process != nil {
 			cw.ffmpegCmd.Process.Kill()
 		}
+		cw.ffmpegMu.Unlock()
 	}()
 
 	// Main capture loop with recovery
@@ -387,30 +251,43 @@ func (cw *CaptureWorker) tryRealCameraCapture() bool {
 	commonArgs := []string{"-thread_queue_size", "512", "-probesize", "32", "-analyzeduration", "0"}
 	outputArgs := []string{"-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "5", "-"}
 
+	// buildArgs safely constructs FFmpeg args without mutating commonArgs/outputArgs.
+	// Using append(append(commonArgs, ...), outputArgs...) would corrupt commonArgs
+	// on subsequent calls if the first append didn't grow the backing array.
+	buildArgs := func(inputArgs ...string) []string {
+		args := make([]string, 0, len(commonArgs)+len(inputArgs)+len(outputArgs))
+		args = append(args, commonArgs...)
+		args = append(args, inputArgs...)
+		args = append(args, outputArgs...)
+		return args
+	}
+
+	fpsStr := fmt.Sprintf("%d", fps)
+
 	// Primary format from config
 	if format == "mjpeg" {
-		formats = append(formats, append(append(commonArgs,
+		formats = append(formats, buildArgs(
 			"-f", "v4l2", "-input_format", "mjpeg", "-video_size", videoSize,
-			"-framerate", fmt.Sprintf("%d", fps), "-i", cw.camera.DevicePath), outputArgs...))
+			"-framerate", fpsStr, "-i", cw.camera.DevicePath))
 		// YUYV fallback
-		formats = append(formats, append(append(commonArgs,
+		formats = append(formats, buildArgs(
 			"-f", "v4l2", "-input_format", "yuyv422", "-video_size", videoSize,
-			"-framerate", fmt.Sprintf("%d", fps), "-i", cw.camera.DevicePath), outputArgs...))
+			"-framerate", fpsStr, "-i", cw.camera.DevicePath))
 	} else if format == "yuyv" {
 		// YUYV first if configured
-		formats = append(formats, append(append(commonArgs,
+		formats = append(formats, buildArgs(
 			"-f", "v4l2", "-input_format", "yuyv422", "-video_size", videoSize,
-			"-framerate", fmt.Sprintf("%d", fps), "-i", cw.camera.DevicePath), outputArgs...))
+			"-framerate", fpsStr, "-i", cw.camera.DevicePath))
 		// MJPEG fallback
-		formats = append(formats, append(append(commonArgs,
+		formats = append(formats, buildArgs(
 			"-f", "v4l2", "-input_format", "mjpeg", "-video_size", videoSize,
-			"-framerate", fmt.Sprintf("%d", fps), "-i", cw.camera.DevicePath), outputArgs...))
+			"-framerate", fpsStr, "-i", cw.camera.DevicePath))
 	}
 
 	// Auto format detection as last resort
-	formats = append(formats, append(append(commonArgs,
+	formats = append(formats, buildArgs(
 		"-f", "v4l2", "-video_size", videoSize,
-		"-framerate", fmt.Sprintf("%d", fps), "-i", cw.camera.DevicePath), outputArgs...))
+		"-framerate", fpsStr, "-i", cw.camera.DevicePath))
 
 	for _, args := range formats {
 		if !cw.running.Load() {
@@ -464,13 +341,6 @@ func (cw *CaptureWorker) tryFFmpegCapture(args []string) bool {
 	readBuffer := make([]byte, 8192)    // Larger buffer for fewer syscalls
 	frameData := make([]byte, 0, 65536) // Pre-allocate typical JPEG size
 
-	// Time-based frame limiting - more reliable than counter-based
-	// Camera may ignore FPS request and send at max rate
-	targetFPS := int(cw.targetFPS.Load())
-	if targetFPS <= 0 {
-		targetFPS = cw.settings.FPS // Use config default
-	}
-	minFrameInterval := time.Second / time.Duration(targetFPS)
 	lastProcessedTime := time.Now()
 
 	// Read frames from FFmpeg output - FFmpeg controls the rate
@@ -480,6 +350,13 @@ func (cw *CaptureWorker) tryFFmpegCapture(args []string) bool {
 		case <-cw.stopCh:
 			return true
 		default:
+			// Re-read targetFPS each iteration so SetFPS() changes take effect
+			targetFPS := int(cw.targetFPS.Load())
+			if targetFPS <= 0 {
+				targetFPS = cw.settings.FPS
+			}
+			minFrameInterval := time.Second / time.Duration(targetFPS)
+
 			// Read raw JPEG bytes (must read to stay in sync with stream)
 			jpegData, err := cw.readMJPEGFrameRaw(stdout, readBuffer, &frameData)
 			if err != nil {
@@ -540,8 +417,15 @@ func (cw *CaptureWorker) readMJPEGFrameRaw(reader io.Reader, buffer []byte, fram
 	*frameData = (*frameData)[:0]
 
 	// Timeout for reading a complete frame (prevents freeze during vibration)
-	// At 30fps, a frame should complete in ~33ms, give 100ms margin
-	frameTimeout := 150 * time.Millisecond
+	// Scale with FPS: at 30fps a frame is ~33ms, at 5fps ~200ms; add generous margin
+	fps := int(cw.targetFPS.Load())
+	if fps <= 0 {
+		fps = cw.settings.FPS
+	}
+	frameTimeout := time.Duration(float64(time.Second)/float64(fps)*3) + 50*time.Millisecond
+	if frameTimeout < 150*time.Millisecond {
+		frameTimeout = 150 * time.Millisecond
+	}
 	frameStart := time.Now()
 
 	// Find SOI marker (0xFFD8)
@@ -576,6 +460,8 @@ func (cw *CaptureWorker) readMJPEGFrameRaw(reader io.Reader, buffer []byte, fram
 	}
 
 	// Find EOI marker (0xFFD9)
+	// Track last-scanned position to avoid O(n^2) rescanning on each Read()
+	scanFrom := 1
 	for {
 		// Check timeout
 		if time.Since(frameStart) > frameTimeout {
@@ -584,7 +470,7 @@ func (cw *CaptureWorker) readMJPEGFrameRaw(reader io.Reader, buffer []byte, fram
 		}
 
 		if len(*frameData) > 10 {
-			for i := 1; i < len(*frameData); i++ {
+			for i := scanFrom; i < len(*frameData); i++ {
 				if (*frameData)[i-1] == 0xFF && (*frameData)[i] == 0xD9 {
 					// Found complete frame - copy the JPEG data
 					jpegData := make([]byte, i+1)
@@ -600,6 +486,12 @@ func (cw *CaptureWorker) readMJPEGFrameRaw(reader io.Reader, buffer []byte, fram
 
 					return jpegData, nil
 				}
+			}
+			// Next time, start scanning from where we left off minus 1
+			// (minus 1 because the EOI marker spans two bytes)
+			scanFrom = len(*frameData) - 1
+			if scanFrom < 1 {
+				scanFrom = 1
 			}
 		}
 
@@ -677,35 +569,10 @@ func (cw *CaptureWorker) runTestPatternLoop() {
 	}
 }
 
-// sendFrame sends frame to FrameBuffer or channel
+// sendFrame sends frame to FrameBuffer
 func (cw *CaptureWorker) sendFrame(frame image.Image) {
-	// Prefer FrameBuffer (lock-free, non-blocking)
 	if cw.frameBuffer != nil {
 		cw.frameBuffer.Write(frame)
-		return
-	}
-
-	// Fall back to channel mode with panic recovery
-	cw.safeSendFrame(frame)
-}
-
-// safeSendFrame sends a frame to the channel with panic recovery for closed channels
-func (cw *CaptureWorker) safeSendFrame(frame image.Image) {
-	defer func() {
-		if r := recover(); r != nil {
-			// Channel was closed, stop running
-			cw.running.Store(false)
-		}
-	}()
-
-	if !cw.running.Load() {
-		return
-	}
-
-	select {
-	case cw.frameCh <- frame:
-	default:
-		// Channel full, skip frame
 	}
 }
 
@@ -713,6 +580,7 @@ func (cw *CaptureWorker) safeSendFrame(frame image.Image) {
 func (cw *CaptureWorker) generateTestFrame(frameNum int) image.Image {
 	width, height := cw.settings.Width, cw.settings.Height
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	stride := img.Stride
 
 	// Create realistic patterns that simulate camera input
 	cameraIDNum := 0
@@ -722,7 +590,13 @@ func (cw *CaptureWorker) generateTestFrame(frameNum int) image.Image {
 		}
 	}
 
+	// Cache time.Now() once per frame instead of per-pixel
+	now := time.Now()
+	sec := now.Second()
+	timestamp := int(now.Unix())
+
 	for y := 0; y < height; y++ {
+		rowOff := y * stride
 		for x := 0; x < width; x++ {
 			var r, g, b uint8
 
@@ -734,13 +608,13 @@ func (cw *CaptureWorker) generateTestFrame(frameNum int) image.Image {
 				b = uint8(250 * (1 - gradient))
 
 				if x%80 < 20 && y%60 < 15 {
-					white := uint8(200 + int(15*time.Now().Second()%55))
+					white := uint8(200 + int(15*sec%55))
 					r, g, b = white, white, white
 				}
 
 			case 1: // Camera 1 - Green landscape
-				r = uint8(50 + 20*time.Now().Second()%30)
-				g = uint8(120 + 30*time.Now().Second()%40)
+				r = uint8(50 + 20*sec%30)
+				g = uint8(120 + 30*sec%40)
 				b = uint8(50)
 
 				if x%100 < 10 && y%100 < 10 {
@@ -748,7 +622,7 @@ func (cw *CaptureWorker) generateTestFrame(frameNum int) image.Image {
 				}
 
 			case 2: // Camera 2 - Urban scene
-				gray := uint8(128 + 50*time.Now().Second()%80)
+				gray := uint8(128 + 50*sec%80)
 				r, g, b = gray, gray, gray
 
 				if (x%40 < 5 || y%30 < 3) && x+y > 200 {
@@ -762,12 +636,15 @@ func (cw *CaptureWorker) generateTestFrame(frameNum int) image.Image {
 			}
 
 			// Add time overlay to show "live" nature
-			timestamp := int(time.Now().Unix())
 			if (timestamp%100) < 50 && x < 50 && y < 20 {
 				r, g, b = 255, 255, 255
 			}
 
-			img.Set(x, y, color.RGBA{r, g, b, 255})
+			off := rowOff + x*4
+			img.Pix[off+0] = r
+			img.Pix[off+1] = g
+			img.Pix[off+2] = b
+			img.Pix[off+3] = 255
 		}
 	}
 

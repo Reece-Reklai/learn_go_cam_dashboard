@@ -34,14 +34,30 @@ func init() {
 // It converts to grayscale, applies 1.6x brightness gain, and maps
 // the result to the red channel only.
 //
+// If dst is non-nil and has sufficient capacity, it will be reused to avoid
+// allocation. The caller can maintain a per-slot buffer for this purpose.
+//
 // This is optimized for the common case of *image.RGBA and *image.NRGBA
 // but falls back to the generic color.Model interface for other types.
 func applyNightMode(src image.Image) *image.RGBA {
+	return applyNightModeReuse(src, nil)
+}
+
+// applyNightModeReuse is like applyNightMode but reuses dst if possible.
+func applyNightModeReuse(src image.Image, dst *image.RGBA) *image.RGBA {
 	bounds := src.Bounds()
 	w := bounds.Dx()
 	h := bounds.Dy()
+	neededLen := w * h * 4
 
-	dst := image.NewRGBA(image.Rect(0, 0, w, h))
+	// Reuse dst buffer if it has enough capacity
+	if dst != nil && cap(dst.Pix) >= neededLen {
+		dst.Pix = dst.Pix[:neededLen]
+		dst.Stride = w * 4
+		dst.Rect = image.Rect(0, 0, w, h)
+	} else {
+		dst = image.NewRGBA(image.Rect(0, 0, w, h))
+	}
 
 	// Fast path for RGBA source
 	if rgba, ok := src.(*image.RGBA); ok {

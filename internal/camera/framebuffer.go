@@ -7,8 +7,9 @@ import (
 	"time"
 )
 
-// FrameBuffer provides lock-free access to the latest frame
-// Capture writes at max speed, UI reads when ready
+// FrameBuffer provides mutex-protected access to the latest frame.
+// Capture writes at max speed, UI reads when ready.
+// Uses double-buffering with a RWMutex to safely swap read/write slots.
 type FrameBuffer struct {
 	// Double-buffering with atomic swap
 	frames     [2]image.Image

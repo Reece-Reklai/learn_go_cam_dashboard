@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -41,7 +42,7 @@ type App struct {
 	cameraWidgets [3]*TappableImage // References to camera TappableImage widgets
 	cameraStatus  [3]bool           // true = connected, false = disconnected
 	lastFrameRead [3]uint64         // Last frame timestamp read from each buffer
-	frameLock     sync.RWMutex
+	frameLock     sync.RWMutex      // Protects cameras, cameraFrames, cameraStatus, lastFrameTime
 
 	// All 4 grid widgets (for highlighting during swap)
 	gridWidgets [4]Highlightable
@@ -49,11 +50,13 @@ type App struct {
 	// UI state
 	swapMode          bool
 	swapSourceSlot    int // Grid position (0-3)
-	isFullscreen      bool
+	isFullscreen      atomic.Bool
 	fullscreenSlot    int
 	fullscreenImg     *canvas.Image
 	fullscreenWidget  *TappableImage
 	fullscreenContent *fyne.Container
+	fullscreenStopCh  chan struct{} // Stops the fullscreen update goroutine
+	fullscreenMu      sync.Mutex    // Protects fullscreen state transitions
 	gridContent       *fyne.Container
 	grid              *fyne.Container
 
@@ -62,6 +65,7 @@ type App struct {
 	reinitInProgress   bool // Prevents concurrent reinitializations
 	reinitLock         sync.Mutex
 	lastDisconnectTime [3]time.Time // Per-camera debounce tracking
+	cleanupOnce        sync.Once    // Prevents double close of hotplugStopCh
 
 	// Stale frame detection + bounded auto-restart
 	lastFrameTime   [3]time.Time   // When each camera last produced a frame
@@ -70,7 +74,9 @@ type App struct {
 	restartLimitHit [3]bool        // Whether restart limit was reached
 
 	// Night mode
-	nightModeEnabled bool
+	nightModeEnabled atomic.Bool
+	nightModeBufs    [3]*image.RGBA // Reusable buffers for night mode (one per camera slot)
+	nightModeFSBuf   *image.RGBA    // Reusable buffer for fullscreen night mode
 
 	// Performance management
 	perfController *perf.AdaptiveController
@@ -130,10 +136,22 @@ func NewApp(cfg *config.Config) *App {
 
 func createColoredImage(width, height int, c color.Color) image.Image {
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
-	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
-			img.Set(x, y, c)
-		}
+	r, g, b, a := c.RGBA()
+	r8, g8, b8, a8 := uint8(r>>8), uint8(g>>8), uint8(b>>8), uint8(a>>8)
+
+	// Fill first row with direct Pix writes
+	stride := img.Stride
+	for x := 0; x < width; x++ {
+		off := x * 4
+		img.Pix[off+0] = r8
+		img.Pix[off+1] = g8
+		img.Pix[off+2] = b8
+		img.Pix[off+3] = a8
+	}
+	// Copy first row to remaining rows
+	firstRow := img.Pix[:stride]
+	for y := 1; y < height; y++ {
+		copy(img.Pix[y*stride:(y+1)*stride], firstRow)
 	}
 	return img
 }
@@ -474,7 +492,7 @@ func (a *App) setupUI() {
 		},
 		func() {
 			a.toggleNightMode()
-			settingsWidget.SetNightModeLabel(a.nightModeEnabled)
+			settingsWidget.SetNightModeLabel(a.nightModeEnabled.Load())
 		},
 		func() { a.onWidgetTap(settingsWidget) },
 		func() { a.onWidgetLongPress(settingsWidget) },
@@ -682,7 +700,7 @@ func (a *App) swapGridPositions(pos1, pos2 int) {
 }
 
 func (a *App) showFullscreen(gridPos int) {
-	if a.isFullscreen {
+	if a.isFullscreen.Load() {
 		return
 	}
 
@@ -697,12 +715,15 @@ func (a *App) showFullscreen(gridPos int) {
 
 	// Camera index
 	camIndex := contentType
-	if camIndex >= len(a.cameras) {
+	a.frameLock.RLock()
+	camCount := len(a.cameras)
+	a.frameLock.RUnlock()
+	if camIndex >= camCount {
 		log.Printf("[UI] No camera at grid position %d (camera index %d)", gridPos, camIndex)
 		return
 	}
 
-	a.isFullscreen = true
+	a.isFullscreen.Store(true)
 	a.fullscreenSlot = gridPos
 	log.Printf("[UI] Fullscreen: camera %d from grid position %d", camIndex, gridPos)
 
@@ -713,7 +734,7 @@ func (a *App) showFullscreen(gridPos int) {
 
 	if currentFrame != nil {
 		displayFrame := currentFrame
-		if a.nightModeEnabled {
+		if a.nightModeEnabled.Load() {
 			displayFrame = applyNightMode(currentFrame)
 		}
 		a.fullscreenImg.Image = displayFrame
@@ -724,44 +745,71 @@ func (a *App) showFullscreen(gridPos int) {
 	a.gridContent.Hide()
 	a.fullscreenContent.Show()
 
+	// Stop any previous fullscreen update goroutine (mutex prevents double-close)
+	a.fullscreenMu.Lock()
+	if a.fullscreenStopCh != nil {
+		close(a.fullscreenStopCh)
+	}
+	a.fullscreenStopCh = make(chan struct{})
+	stopCh := a.fullscreenStopCh
+	a.fullscreenMu.Unlock()
+
 	// Start fullscreen update loop
-	go a.updateFullscreenLoop(camIndex)
+	go a.updateFullscreenLoop(camIndex, stopCh)
 }
 
 func (a *App) hideFullscreen() {
-	if !a.isFullscreen {
+	if !a.isFullscreen.Load() {
 		return
 	}
 	log.Println("[UI] Exiting fullscreen")
-	a.isFullscreen = false
+	a.isFullscreen.Store(false)
+
+	// Stop fullscreen update goroutine (mutex prevents double-close)
+	a.fullscreenMu.Lock()
+	if a.fullscreenStopCh != nil {
+		close(a.fullscreenStopCh)
+		a.fullscreenStopCh = nil
+	}
+	a.fullscreenMu.Unlock()
 
 	// Hide fullscreen, show grid
 	a.fullscreenContent.Hide()
 	a.gridContent.Show()
 }
 
-func (a *App) updateFullscreenLoop(camIndex int) {
-	ticker := time.NewTicker(66 * time.Millisecond)
+func (a *App) updateFullscreenLoop(camIndex int, stopCh chan struct{}) {
+	uiFPS := a.cfg.UIFPS
+	if uiFPS <= 0 {
+		uiFPS = 15
+	}
+	ticker := time.NewTicker(time.Second / time.Duration(uiFPS))
 	defer ticker.Stop()
 
-	for range ticker.C {
-		if !a.isFullscreen {
+	for {
+		select {
+		case <-stopCh:
 			return
-		}
-
-		a.frameLock.RLock()
-		frame := a.cameraFrames[camIndex]
-		a.frameLock.RUnlock()
-
-		if frame != nil && a.fullscreenImg != nil {
-			// Apply night mode filter if enabled
-			displayFrame := frame
-			if a.nightModeEnabled {
-				displayFrame = applyNightMode(frame)
+		case <-ticker.C:
+			if !a.isFullscreen.Load() {
+				return
 			}
 
-			a.fullscreenImg.Image = displayFrame
-			a.fullscreenImg.Refresh()
+			a.frameLock.RLock()
+			frame := a.cameraFrames[camIndex]
+			a.frameLock.RUnlock()
+
+			if frame != nil && a.fullscreenImg != nil {
+				// Apply night mode filter if enabled
+				displayFrame := frame
+				if a.nightModeEnabled.Load() {
+					a.nightModeFSBuf = applyNightModeReuse(frame, a.nightModeFSBuf)
+					displayFrame = a.nightModeFSBuf
+				}
+
+				a.fullscreenImg.Image = displayFrame
+				a.fullscreenImg.Refresh()
+			}
 		}
 	}
 }
@@ -790,7 +838,7 @@ func (a *App) initializeCamerasAsync() {
 		Width:  a.cfg.CaptureWidth,
 		Height: a.cfg.CaptureHeight,
 		FPS:    a.cfg.CaptureFPS,
-		Format: camera.DefaultFormat,
+		Format: a.cfg.CaptureFormat,
 	}, true)
 
 	if err := a.manager.Initialize(); err != nil {
@@ -804,9 +852,12 @@ func (a *App) initializeCamerasAsync() {
 		return
 	}
 
-	a.cameras = a.manager.GetCameras()
-	log.Printf("[UI] Discovered %d cameras", len(a.cameras))
-	for i, cam := range a.cameras {
+	cams := a.manager.GetCameras()
+	a.frameLock.Lock()
+	a.cameras = cams
+	a.frameLock.Unlock()
+	log.Printf("[UI] Discovered %d cameras", len(cams))
+	for i, cam := range cams {
 		log.Printf("[UI]   - %s: %s", cam.DeviceID, cam.DevicePath)
 		// Mark camera as connected and update UI
 		if i < 3 {
@@ -820,91 +871,80 @@ func (a *App) initializeCamerasAsync() {
 
 func (a *App) startCameraRefresh() {
 	go func() {
-		// UI refresh rate - independent of capture rate
-		// Capture runs as fast as possible, UI renders at this rate
-		ticker := time.NewTicker(33 * time.Millisecond) // ~30 FPS UI refresh
+		// UI refresh rate from config
+		uiFPS := a.cfg.UIFPS
+		if uiFPS <= 0 {
+			uiFPS = 30
+		}
+		refreshInterval := time.Second / time.Duration(uiFPS)
+		ticker := time.NewTicker(refreshInterval)
 		defer ticker.Stop()
 
 		frameCounters := make(map[string]uint64)
 
-		for range ticker.C {
-			if a.manager == nil || len(a.cameras) == 0 {
+		for {
+			select {
+			case <-a.hotplugStopCh:
+				return
+			case <-ticker.C:
+			}
+
+			if a.manager == nil {
+				continue
+			}
+
+			a.frameLock.RLock()
+			camCount := len(a.cameras)
+			cameras := make([]camera.Camera, camCount)
+			copy(cameras, a.cameras)
+			a.frameLock.RUnlock()
+
+			if camCount == 0 {
 				continue
 			}
 
 			// Update each camera's image (camera indices 0, 1, 2)
-			for camIndex := 0; camIndex < 3 && camIndex < len(a.cameras); camIndex++ {
-				cameraID := a.cameras[camIndex].DeviceID
+			for camIndex := 0; camIndex < 3 && camIndex < camCount; camIndex++ {
+				cameraID := cameras[camIndex].DeviceID
 
 				// Try buffer mode first (preferred)
-				if a.manager.IsBufferMode() {
-					buffer := a.manager.GetFrameBuffer(cameraID)
-					if buffer == nil {
-						continue
-					}
+				buffer := a.manager.GetFrameBuffer(cameraID)
+				if buffer == nil {
+					continue
+				}
 
-					// Only update if there's a new frame (avoids unnecessary refreshes)
-					frame, frameNum, hasNew := buffer.ReadIfNew(a.lastFrameRead[camIndex])
-					if !hasNew || frame == nil {
-						continue // No new frame
-					}
+				// Only update if there's a new frame (avoids unnecessary refreshes)
+				frame, frameNum, hasNew := buffer.ReadIfNew(a.lastFrameRead[camIndex])
+				if !hasNew || frame == nil {
+					continue // No new frame
+				}
 
-					a.lastFrameRead[camIndex] = frameNum
+				a.lastFrameRead[camIndex] = frameNum
 
-					// Track frame arrival time for stale detection
-					a.frameLock.Lock()
-					a.cameraFrames[camIndex] = frame
-					a.lastFrameTime[camIndex] = time.Now()
-					a.frameLock.Unlock()
+				// Track frame arrival time for stale detection
+				a.frameLock.Lock()
+				a.cameraFrames[camIndex] = frame
+				a.lastFrameTime[camIndex] = time.Now()
+				a.frameLock.Unlock()
 
-					// Apply night mode filter if enabled
-					displayFrame := frame
-					if a.nightModeEnabled {
-						displayFrame = applyNightMode(frame)
-					}
+				// Apply night mode filter if enabled
+				displayFrame := frame
+				if a.nightModeEnabled.Load() {
+					a.nightModeBufs[camIndex] = applyNightModeReuse(frame, a.nightModeBufs[camIndex])
+					displayFrame = a.nightModeBufs[camIndex]
+				}
 
-					// Update the camera image widget
-					// Fyne's Refresh is thread-safe but can be slow if backed up
-					a.cameraImages[camIndex].Image = displayFrame
-					a.cameraImages[camIndex].Refresh()
+				// Update the camera image widget
+				// Fyne's Refresh is thread-safe but can be slow if backed up
+				a.cameraImages[camIndex].Image = displayFrame
+				a.cameraImages[camIndex].Refresh()
 
-					frameCounters[cameraID]++
-					if frameCounters[cameraID]%90 == 1 { // Log every 90 frames (~3 sec at 30fps)
-						fps, totalFrames, _ := buffer.GetCaptureStats()
-						droppedCount := buffer.GetDroppedCount()
-						log.Printf("[UI] Camera %s: frame #%d, buffer stats: %d captured, %d dropped, %.1f fps",
-							cameraID, frameCounters[cameraID], totalFrames, droppedCount, fps)
-					}
-				} else {
-					// Legacy channel mode fallback
-					frameCh := a.manager.GetFrameChannel(cameraID)
-					if frameCh == nil {
-						continue
-					}
-
-					select {
-					case frame := <-frameCh:
-						a.frameLock.Lock()
-						a.cameraFrames[camIndex] = frame
-						a.lastFrameTime[camIndex] = time.Now()
-						a.frameLock.Unlock()
-
-						// Apply night mode filter if enabled
-						displayFrame := frame
-						if a.nightModeEnabled {
-							displayFrame = applyNightMode(frame)
-						}
-
-						// Update the camera image widget
-						a.cameraImages[camIndex].Image = displayFrame
-						a.cameraImages[camIndex].Refresh()
-
-						frameCounters[cameraID]++
-						if frameCounters[cameraID]%60 == 1 {
-							log.Printf("[UI] Camera %s (index %d): frame #%d", cameraID, camIndex, frameCounters[cameraID])
-						}
-					default:
-					}
+				frameCounters[cameraID]++
+				if frameCounters[cameraID]%90 == 1 { // Log every 90 frames (~3 sec at 30fps)
+					fps, totalFrames, _ := buffer.GetCaptureStats()
+					droppedCount := buffer.GetDroppedCount()
+					log.Printf("[UI] Camera %s: frame #%d, buffer stats: %d captured, %d dropped, %.1f fps",
+						cameraID, frameCounters[cameraID], totalFrames, droppedCount, fps)
 				}
 			}
 		}
@@ -938,8 +978,9 @@ func (a *App) updateCameraStatus(camIndex int, connected bool) {
 
 // toggleNightMode toggles the night mode state and logs the change.
 func (a *App) toggleNightMode() {
-	a.nightModeEnabled = !a.nightModeEnabled
-	if a.nightModeEnabled {
+	wasEnabled := a.nightModeEnabled.Load()
+	a.nightModeEnabled.Store(!wasEnabled)
+	if !wasEnabled {
 		log.Println("[UI] Night mode enabled")
 	} else {
 		log.Println("[UI] Night mode disabled")
@@ -986,21 +1027,22 @@ func (a *App) logHealthSummary() {
 	}
 
 	now := time.Now()
-	staleThreshold := 10.0 // seconds — matches Python default
+	staleThreshold := a.cfg.StaleFrameTimeoutSec // H7: use config instead of hardcoded 10.0
 	online := 0
 	stale := 0
 	disconnected := 0
 	totalSlots := a.cfg.CameraSlotCount
 
 	for camIndex := 0; camIndex < totalSlots && camIndex < 3; camIndex++ {
-		if !a.cameraStatus[camIndex] {
+		a.frameLock.RLock()
+		connected := a.cameraStatus[camIndex]
+		lastFrame := a.lastFrameTime[camIndex]
+		a.frameLock.RUnlock()
+
+		if !connected {
 			disconnected++
 			continue
 		}
-
-		a.frameLock.RLock()
-		lastFrame := a.lastFrameTime[camIndex]
-		a.frameLock.RUnlock()
 
 		if lastFrame.IsZero() {
 			// Never received a frame — treat as stale
@@ -1053,21 +1095,30 @@ func (a *App) startStaleFrameDetection() {
 
 // checkStaleFrames checks each connected camera for stale frames
 func (a *App) checkStaleFrames() {
-	if a.manager == nil || len(a.cameras) == 0 {
+	if a.manager == nil {
+		return
+	}
+
+	a.frameLock.RLock()
+	camCount := len(a.cameras)
+	a.frameLock.RUnlock()
+
+	if camCount == 0 {
 		return
 	}
 
 	now := time.Now()
 	staleTimeout := time.Duration(a.cfg.StaleFrameTimeoutSec * float64(time.Second))
 
-	for camIndex := 0; camIndex < 3 && camIndex < len(a.cameras); camIndex++ {
-		if !a.cameraStatus[camIndex] {
-			continue // Skip disconnected cameras
-		}
-
+	for camIndex := 0; camIndex < 3 && camIndex < camCount; camIndex++ {
 		a.frameLock.RLock()
+		connected := a.cameraStatus[camIndex]
 		lastFrame := a.lastFrameTime[camIndex]
 		a.frameLock.RUnlock()
+
+		if !connected {
+			continue // Skip disconnected cameras
+		}
 
 		// Skip if we haven't received any frames yet (still initializing)
 		if lastFrame.IsZero() {
@@ -1154,8 +1205,14 @@ func (a *App) restartCaptureIfStale(camIndex int) {
 		}
 
 		// Kill any processes holding this camera device before restart
+		a.frameLock.RLock()
+		var devPath string
 		if idx < len(a.cameras) {
-			helpers.KillDeviceHolders(a.cameras[idx].DevicePath, a.cfg.KillDeviceHolders)
+			devPath = a.cameras[idx].DevicePath
+		}
+		a.frameLock.RUnlock()
+		if devPath != "" {
+			helpers.KillDeviceHolders(devPath, a.cfg.KillDeviceHolders)
 		}
 
 		if err := a.manager.RestartCameraByIndex(idx); err != nil {
@@ -1196,7 +1253,16 @@ func (a *App) startHotplugDetection() {
 func (a *App) checkCameraChanges() {
 	// Simple check: just verify device files exist (don't use v4l2-ctl to avoid conflicts with FFmpeg)
 	// Check for disconnections in our existing cameras
-	for i, cam := range a.cameras {
+	a.frameLock.RLock()
+	cameras := make([]camera.Camera, len(a.cameras))
+	copy(cameras, a.cameras)
+	var statusSnapshot [3]bool
+	for i := 0; i < 3 && i < len(cameras); i++ {
+		statusSnapshot[i] = a.cameraStatus[i]
+	}
+	a.frameLock.RUnlock()
+
+	for i, cam := range cameras {
 		if i >= 3 {
 			break
 		}
@@ -1205,7 +1271,7 @@ func (a *App) checkCameraChanges() {
 		_, err := os.Stat(cam.DevicePath)
 		deviceExists := err == nil
 
-		wasConnected := a.cameraStatus[i]
+		wasConnected := statusSnapshot[i]
 
 		if wasConnected && !deviceExists {
 			// Camera disconnected - record time for debouncing
@@ -1237,20 +1303,25 @@ func (a *App) checkForNewCameras() {
 
 	// Only check if we have empty slots (fewer than 3 connected cameras)
 	connectedCount := 0
+	a.frameLock.RLock()
+	camCount := len(a.cameras)
 	for i := 0; i < 3; i++ {
-		if i < len(a.cameras) && a.cameraStatus[i] {
+		if i < camCount && a.cameraStatus[i] {
 			connectedCount++
 		}
 	}
+	a.frameLock.RUnlock()
 	if connectedCount >= 3 {
 		return // All slots full
 	}
 
 	// Build set of existing device paths we're already tracking
 	existingPaths := make(map[string]bool)
+	a.frameLock.RLock()
 	for _, cam := range a.cameras {
 		existingPaths[cam.DevicePath] = true
 	}
+	a.frameLock.RUnlock()
 
 	// Scan /dev/video* for potential new USB cameras
 	// USB cameras on Pi typically use even numbers (video0, video2, video4, etc.)
@@ -1352,12 +1423,14 @@ func (a *App) handleNewCameraDevice(devPath string) {
 
 	// Find an empty/disconnected slot
 	emptySlot := -1
+	a.frameLock.RLock()
 	for i := 0; i < 3; i++ {
 		if i >= len(a.cameras) || !a.cameraStatus[i] {
 			emptySlot = i
 			break
 		}
 	}
+	a.frameLock.RUnlock()
 
 	if emptySlot < 0 {
 		log.Printf("[Hotplug] New camera detected (%s) but no empty slots available", devPath)
@@ -1390,7 +1463,7 @@ func (a *App) handleNewCameraDevice(devPath string) {
 			Width:  a.cfg.CaptureWidth,
 			Height: a.cfg.CaptureHeight,
 			FPS:    a.cfg.CaptureFPS,
-			Format: camera.DefaultFormat,
+			Format: a.cfg.CaptureFormat,
 		}, true)
 		if err := a.manager.Initialize(); err != nil {
 			log.Printf("[Hotplug] Failed to reinitialize manager: %v", err)
@@ -1401,10 +1474,13 @@ func (a *App) handleNewCameraDevice(devPath string) {
 			return
 		}
 
-		a.cameras = a.manager.GetCameras()
-		log.Printf("[Hotplug] Reinitialized with %d cameras", len(a.cameras))
+		cams := a.manager.GetCameras()
+		a.frameLock.Lock()
+		a.cameras = cams
+		a.frameLock.Unlock()
+		log.Printf("[Hotplug] Reinitialized with %d cameras", len(cams))
 
-		for i := range a.cameras {
+		for i := range cams {
 			if i < 3 {
 				a.updateCameraStatus(i, true)
 			}
@@ -1446,8 +1522,14 @@ func (a *App) handleCameraReconnect(camIndex int) {
 		time.Sleep(1500 * time.Millisecond)
 
 		// Kill any stale processes holding the device before restart
+		a.frameLock.RLock()
+		var devPath string
 		if camIndex < len(a.cameras) {
-			helpers.KillDeviceHolders(a.cameras[camIndex].DevicePath, a.cfg.KillDeviceHolders)
+			devPath = a.cameras[camIndex].DevicePath
+		}
+		a.frameLock.RUnlock()
+		if devPath != "" {
+			helpers.KillDeviceHolders(devPath, a.cfg.KillDeviceHolders)
 		}
 
 		// Restart only this camera's worker
@@ -1466,40 +1548,46 @@ func (a *App) handleCameraReconnect(camIndex int) {
 
 // cleanup stops all processes and exits cleanly
 func (a *App) cleanup() {
-	log.Println("[UI] Cleanup: stopping all processes...")
+	a.cleanupOnce.Do(func() {
+		log.Println("[UI] Cleanup: stopping all processes...")
 
-	// Stop hot-plug detection
-	select {
-	case <-a.hotplugStopCh:
-		// Already closed
-	default:
+		// Stop hot-plug detection
 		close(a.hotplugStopCh)
-	}
 
-	// Stop camera manager (kills FFmpeg processes)
-	if a.manager != nil {
-		a.manager.Stop()
-		log.Println("[UI] Cleanup: stopped camera manager")
-	}
+		// Stop performance controller
+		if a.perfController != nil {
+			a.perfController.Stop()
+		}
 
-	// Kill any remaining FFmpeg processes (belt and suspenders)
-	killFFmpegProcesses()
+		// Stop camera manager (kills FFmpeg processes)
+		if a.manager != nil {
+			a.manager.Stop()
+			log.Println("[UI] Cleanup: stopped camera manager")
+		}
 
-	log.Println("[UI] Cleanup: complete, exiting...")
-	a.fyneApp.Quit()
+		log.Println("[UI] Cleanup: complete, exiting...")
+		a.fyneApp.Quit()
+	})
 }
 
 // restart stops all processes and restarts the application
 func (a *App) restart() {
 	log.Println("[UI] Restart: stopping all processes...")
 
+	// Stop performance controller
+	if a.perfController != nil {
+		a.perfController.Stop()
+	}
+
 	// Stop camera manager
 	if a.manager != nil {
 		a.manager.Stop()
 	}
 
-	// Kill any remaining FFmpeg processes
-	killFFmpegProcesses()
+	// Stop all background goroutines (hotplug, stale detection, health, refresh)
+	a.cleanupOnce.Do(func() {
+		close(a.hotplugStopCh)
+	})
 
 	log.Println("[UI] Restart: relaunching application...")
 
@@ -1525,36 +1613,7 @@ func (a *App) restart() {
 	a.fyneApp.Quit()
 }
 
-// killFFmpegProcesses kills any remaining FFmpeg processes
-func killFFmpegProcesses() {
-	log.Println("[UI] Killing any remaining FFmpeg processes...")
-
-	// Use pkill to kill FFmpeg processes
-	cmd := exec.Command("pkill", "-9", "-f", "ffmpeg")
-	cmd.Run() // Ignore errors - may not have any FFmpeg processes
-
-	// Also try killall as backup
-	cmd = exec.Command("killall", "-9", "ffmpeg")
-	cmd.Run() // Ignore errors
-
-	log.Println("[UI] FFmpeg cleanup complete")
-}
-
-// SetupSignalHandling sets up signal handlers for clean shutdown
-func (a *App) SetupSignalHandling() {
-	go func() {
-		sigCh := make(chan os.Signal, 1)
-		// Note: signal.Notify would be used here but we handle it via Fyne's lifecycle
-		<-sigCh
-		log.Println("[UI] Received signal, cleaning up...")
-		a.cleanup()
-	}()
-}
-
 // Cleanup is exported for external use (e.g., from main)
 func (a *App) Cleanup() {
-	if a.manager != nil {
-		a.manager.Stop()
-	}
-	killFFmpegProcesses()
+	a.cleanup()
 }

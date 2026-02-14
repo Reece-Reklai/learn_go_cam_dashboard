@@ -103,7 +103,11 @@ func (rw *RotatingFileWriter) rotate() {
 	}
 
 	// Open fresh file
-	rw.openFile()
+	if err := rw.openFile(); err != nil {
+		// If we can't reopen the log file, write to stderr as a fallback.
+		// This avoids silent data loss.
+		fmt.Fprintf(os.Stderr, "config: failed to reopen log file after rotation: %v\n", err)
+	}
 }
 
 // =============================================================================
